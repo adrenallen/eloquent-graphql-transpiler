@@ -1,0 +1,525 @@
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use DB;
+use Illuminate\Support\Facades\Schema;
+use ErrorException;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use ReflectionClass;
+use ReflectionMethod;
+
+use Doctrine\DBAL\Types\Type;
+
+class GraphqlScaffold extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = 'graphql:scaffold 
+                            {fullModelPath : Full path to a model, or a model name itself can be passed to default into looking at the graphql configured model folders}
+                            {--noOverwrite : Do not overwrite an existing schema file for this model if it exists already}
+                            {--noRelationships : Do not scaffold out any relationships for this model} ';
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = 'Scaffold a GraphQL entry for the provided model.';
+
+    const METHOD_ONE = 'methodone';
+    const METHOD_MANY = 'methodmany';
+
+    /**
+     * Create a new command instance.
+     *
+     * @return void
+     */
+    public function __construct()
+    {
+        parent::__construct();
+
+        // Handling Postgres CITEXT column types
+        Type::addType(Citext::CITEXT, Citext::class);
+        DB::connection()->getDoctrineConnection()->getDatabasePlatform()->registerDoctrineTypeMapping('citext', Citext::CITEXT);
+    }
+
+    /**
+     * Execute the console command.
+     *
+     * @return mixed
+     */
+    public function handle()
+    {
+
+        $inputModelPath = $this->argument('fullModelPath');
+        $model = $this->findModel($inputModelPath);
+        if (!$model) {
+            $this->error("Failed to find a model matching " . $inputModelPath);
+            return;
+        }
+        
+        $modelName = $this->getClassName(get_class($model));
+
+        if ($this->option('noOverwrite') 
+            && file_exists(base_path($this->getGraphqlModelFilePath($modelName)))) {
+            $this->warn("This GraphQL model file already exists at " . $this->getGraphqlModelFilePath($modelName));
+            return;
+        }
+
+        $tableName = (new $model)->getTable();
+        
+        $cols = Schema::getColumnListing($tableName);
+        
+        $primaryKey = $model->getKeyName();
+
+        $colDefinitions = [];
+        foreach($cols as $col) {
+            $colType = Schema::getColumnType($tableName, $col);
+            if ($col == $primaryKey) {
+                $gType = 'ID';
+            } else {
+                $gType = $this->columnTypeToGraphType($col, $colType);
+            }            
+            
+            $colDefinitions[$col] = $gType;
+        }
+        
+        $modelColumnEnums = $this->getModelColumnEnums($colDefinitions);
+        $modelFieldDefs = $this->getModelFieldDefString($colDefinitions);
+
+        // If we pass in no relationships we stay as blank otherwise we build relationships out,
+        // this is not recursive, any new models do not build relationships
+        $modelRelationshipDefs = "";
+        if (!$this->option('noRelationships')) {
+            $modelRelationshipDefs = $this->getModelRelationshipDefString($model);
+        }
+
+        $this->newLine();
+        $this->line("Found primary key: " . $primaryKey);
+        
+        $modelQueryName = $this->camelCaseName($modelName);
+        $this->line("Generated camelcase name: " . $modelQueryName);
+        
+        $modelQueryNamePlural = $this->namePlural($modelQueryName);
+        $this->line("Generated plural name: " . $modelQueryNamePlural);
+
+
+        //$modelByQueries = $this->getModelByQueries($modelQueryName, $modelName, $colDefinitions);
+
+        $stub = str_replace(
+            [
+                '{{modelQueryNamePlural}}',
+                '{{modelPrimaryKey}}',
+                '{{modelQueryName}}',
+                '{{modelName}}',
+                '{{modelColumnEnums}}',
+                '{{modelFieldDefinitions}}',
+                '{{modelRelationshipDefinitions}}'
+            ],
+            [
+                $modelQueryNamePlural,
+                $primaryKey,
+                $modelQueryName,
+                $modelName,
+                $modelColumnEnums,
+                $modelFieldDefs,
+                $modelRelationshipDefs
+            ],
+            file_get_contents(resource_path("stubs/GraphQLModel.stub"))
+        );
+
+        $filePath = $this->getGraphqlModelFilePath($modelName);
+        file_put_contents(base_path($filePath), $stub);
+        $this->newLine();
+        $this->info(sprintf('** File generated! %s **', $filePath));
+    }
+
+    private function getModelRelationshipDefString($model) { 
+        $rels = $this->relationships($model);
+        $completedModels = [];
+
+        foreach ($rels as $method => $rel) {
+            $completedModels[$method] = [
+                'rel' => $rel,
+                'completedTypes' =>
+            ];
+
+            for ($i = 0; $i < count($rel->types); $i++) {
+                $isValidModel = false;
+                foreach (config('lighthouse.namespaces.models') as $path) {
+                    //Replace backslash with triple back for regex
+                    $escapedPath = str_replace('\\', '\\\\', $path);
+                    
+                    $regex = sprintf('/^%s\\\[A-Za-z0-9]*$/', $escapedPath);
+                    if (preg_match($regex, $rel->types[$i]['model'])) {
+                        $isValidModel = true;
+                        break;
+                    }
+                }
+                // We verified model is in a path we know about, 
+                // so build the file if needed
+                if ($isValidModel) {
+                    $this->newLine();
+                    $this->info("*** Ensuring ".$rel->types[$i]['model']." is generated ***");
+                    try {
+                        $this->call('graphql:scaffold', [
+                            'fullModelPath' => $rel->types[$i]['model'],
+                            '--noOverwrite' => true,
+                            '--noRelationships' => true
+                        ]);
+                        $completedModels[$method][] = $rel;
+                    $this->info("*** Completed file generation/validation ***");
+                    } catch(\Exception $e) {
+                        $this->error("Error encountered when running build for ".$rel->types[$i]['model'].". Skipping relationship");
+                    }
+                    
+                } else {
+                    $this->line($rel->types[$i]['model']." does not exist in configured GraphQL folders, skipping");
+                }
+            }
+        }
+
+        $relationshipDefs = [];
+        foreach ($completedModels as $method => $mod) {
+            if ( count($mod) > 1) {
+                $this->warn("More than 1 type not supported yet!");
+            } else {
+                $mod = $mod[0];
+            }
+            $completedName = $this->getClassName($mod['model']);
+            $lowerModType = strtolower($mod['type']);
+            switch($lowerModType) {
+                case 'hasone': 
+                case 'belongsto':
+                    $relationshipDefs[] = sprintf('%s: %s @%s', $method, $completedName, $this->camelCaseName($mod['type']));
+                    break;
+                case 'hasonethrough':
+                    $relationshipDefs[] = sprintf('%s: %s @hasOne', $method, $completedName);
+                    break;
+                case 'hasmany':
+                case 'belongstomany':
+                    $relationshipDefs[] = sprintf('%s: [%s] @%s', $method, $completedName, $this->camelCaseName($mod['type']));
+                    break;
+                case 'hasmanythrough':
+                    $relationshipDefs[] = sprintf('%s: [%s] @hasMany', $method, $completedName);
+                    break;
+                default:
+                    $relationshipDefs[] = sprintf('%s: %s @method(name: "%s")', $method, $completedName, $method);
+            }
+            
+        }
+
+        return implode("\n    ", $relationshipDefs);
+
+    }
+
+    private function getGraphqlModelFilePath($modelName) {
+        return "/graphql/models/${modelName}.graphql";
+    }
+
+    // private function getModelByQueries($modelQueryName, $modelName, $colDefinitions) {
+    //     $modelFieldsBy = [];
+    //     foreach($colDefinitions as $col => $gType) {
+    //         $modelFieldsBy[] = sprintf('%sBy(%s: %s @eq): %s @find', )
+    //     }
+    // }
+
+        
+    private function findModel($inputModelPath) {
+        $model = null;
+        try {
+            $model = app($inputModelPath);
+            return $model;
+        } catch (\Exception $e) {
+            $this->warn(sprintf('Did not find model at path %s', $inputModelPath));
+        }
+
+        $modelPaths = config('lighthouse.namespaces.models');
+        foreach ($modelPaths as $modelPath) {
+            try {
+                $tryModelPath = $modelPath . '\\' . $inputModelPath;
+                $model = app($tryModelPath);
+                $this->info("Found a matching model at " . $tryModelPath);
+                return $model;
+            } catch (\Exception $e) {
+                $this->warn(sprintf('Did not find model at path %s', $tryModelPath));
+            }
+        }
+
+        return $model;        
+
+    }
+
+    private function namePlural($string) {
+        return \Illuminate\Support\Str::plural($string);
+    }
+
+    private function camelCaseName($string) {
+        for ($i = 0; $i < strlen($string); $i++) {
+            // First always lowercased
+            // Last always lowercased if we get all the way there
+            // because that means we have an acronym like EDI
+            // otherwise check if we are at the end of first word
+            if($i == 0 || $i+1 == strlen($string) || ctype_upper($string[$i+1])) {
+                $string[$i] = strtolower($string[$i]);
+            } else {
+                break;
+            }
+        }
+        return $string;
+    }
+
+    private function getModelFieldDefString($colDefinitions) {
+        $fieldDefs = [];
+        foreach($colDefinitions as $col => $colType) {
+            $fieldDefs[] = sprintf('%s: %s', $col, $colType);
+        }
+        return implode("\n    ", $fieldDefs);
+    }
+
+    private function getModelColumnEnums($colDefinitions) {
+        $modelColumns = [];
+        foreach($colDefinitions as $col => $colType) {
+            $modelColumns[] = sprintf('%s @enum(value: "%s")', strtoupper($col), $col);
+        }
+        return implode("\n    ", $modelColumns);
+    }
+
+    private function getClassName($fullNamespace) {
+        $path = explode('\\', $fullNamespace);
+        return array_pop($path);
+    }
+
+    private function columnTypeToGraphType($colName, $type) {
+        switch($type) {
+            case 'boolean':
+                return 'Boolean';
+            case 'decimal':
+            case 'float':
+                return 'Float';
+            case 'datetime':
+                return 'DateTime';
+            case 'integer':
+            case 'smallint':
+                return 'Int';
+            case 'guid':
+            case 'string':
+            case 'text':
+            case 'citext':
+                return 'String';
+            case 'datetimetz':
+                return 'DateTimeTz';
+            case 'date':
+                return 'Date';
+            case 'json':
+                return 'JSON';
+            default:
+                $this->error(sprintf("Column %s has type of %s which could not be mapped, defaulting to String (something is probably wrong)", $colName, $type));
+                return 'String';
+        }
+    }
+
+    // Finds all relationships to external classes
+    public function relationships($model) {
+
+        $relationships = [];
+
+        foreach((new ReflectionClass($model))->getMethods(ReflectionMethod::IS_PUBLIC) as $method)
+        {
+            if ($method->class != get_class($model) ||
+                !empty($method->getParameters()) ||
+                $method->getName() == __FUNCTION__) {
+                continue;
+            }
+
+            try {
+
+                $nullable = false;  //is return nullable?
+                $returnTypes = [];  //types possible for return
+                $iterable = null;
+
+
+                // Check docblock first for return type
+                if (strlen($method->getDocComment()) > 0) {
+                    preg_match('/@return\s*(.*)$/m', $method->getDocComment(), $matchesArray);
+                    if (count($matchesArray) > 1) {
+                        $foundTypes = \explode('|', $matchesArray[1]);
+                        try{
+                            foreach ($foundTypes as $foundType) {
+                                
+                                //If just null then mark as nullable type!
+                                if ($foundType == 'null') {
+                                    $nullable = true;
+                                    continue;
+                                }
+
+                                // see if we find an iterable type here
+                                preg_match('/.*\[\]\s*$/', $input_line, $iterableKeyMatches);
+                                $foundType = str_replace('[]', '', $foundType);
+
+                                $returnTypes[] = new $foundType();
+
+                                //Is type iterable?
+                                if ($iterable === null) {
+                                    $iterable = count($iterableKeyMatches) > 0;
+                                } elseif ($iterable !== count($iterableKeyMatches) > 0) {
+                                    throw new \Exception('Iterable and non-iterable combined!');
+                                }
+                                
+                            }
+                        } catch (\Exception $e) {
+                            $this->warn("Whoops we have iterable and non-iterable together so skipping this method!! ${e}");
+                            $returnTypes = [];  //reset so we try next method
+                        }
+                    }
+                }
+
+
+
+                // if no found return types yet
+                // Check type hint next for types
+                if (count($returnTypes) < 1) {
+                    $returnTypeHint = $method->getReturnType();
+
+                    // if getName exists we know it's a real type
+                    // we wanna skip built-in types like Int 
+                    // we're just looking for relationships
+                    if (\method_exists($returnTypeHint, 'getName') && !$returnTypeHint->isBuiltin()) {
+                        $returnTypeHintClass = $returnTypeHint->getName();
+                        
+                        $nullable = $returnTypeHint->allowsNull();
+                        $return = new $returnTypeHintClass();
+
+                        $iterable = is_iterable($return);
+
+                        if ($iterable) {
+                            $return = $return[0];
+                        }
+
+                        $returnTypes[] = $return;
+                        
+                    }
+                }
+
+                // if no found return types yet
+                // check actual invoked type last!
+                if (count($returnTypes) < 1) {
+                    
+                    $return = $method->invoke($model);
+
+                    $iterable = is_iterable($return);
+                    if ($iterable) {
+                        $return = $return[0];
+                    }
+                    
+                    $returnTypes[] = $return;
+                }
+
+//**************************************************************OLD WAY TO DO TI**************************** */
+                // $return = $method->invoke($model);
+                // // If the invoked method returns nothing, 
+                // // try using the type hinted return value
+                // if ($return == null) {
+                //     $returnTypeHint = $method->getReturnType();
+
+                //     // if getName exists we know it's a real type
+                //     // we wanna skip built-in types like Int 
+                //     // we're just looking for relationships
+                //     if (\method_exists($returnTypeHint, 'getName') && !$returnTypeHint->isBuiltin()) {
+                //         $returnTypeHintClass = $returnTypeHint->getName();
+                //         $return = new $returnTypeHintClass();
+                //     } else {
+                //         printf("We could use this instead: \n%s\n", $method->getDocComment());
+                //     }
+                    
+                // } elseif (is_iterable($return)) {
+                //     printf("%s is iterable!\n", $return);   
+                // }
+
+                // If method return type is relationship or an eloquent model
+                // then we can treat them as a relationship we want to map out!
+//****************************************************************************************** */
+
+                $relationships[$method->getName()] = new FoundReturnTypes();
+
+                $relationships[$method->getName()]->nullable = $nullable;
+                $relationships[$method->getName()]->iterable = $iterable;
+
+                foreach ($returnTypes as $returnType) {
+                    if ($returnType instanceof Relation) {
+                        // $relationships[$method->getName()][] = [
+                        //     'type' => (new ReflectionClass($return))->getShortName(),
+                        //     'model' => (new ReflectionClass($return->getRelated()))->getName()
+                        // ];
+                        $relationships[$method->getName()]->addType((new ReflectionClass($return))->getShortName(), (new ReflectionClass($return->getRelated()))->getName());
+                    } elseif (is_subclass_of($returnType, 'Illuminate\Database\Eloquent\Model')){
+
+                        $type = (new ReflectionClass($returnType))->getShortName();
+                        // if ($returnTypeFound->iterable) {
+                        //     $type = "[${type}]";
+                        // }
+                        // For an eloquent model we dont need to grab the related for model
+                        // so slight difference in the build here
+                        // $relationships[$method->getName()][] = [
+                        //     'type' => $type,
+                        //     'model' => (new ReflectionClass($returnType))->getName()
+                        // ];
+                        $relationships[$method->getName()]->addType($type, (new ReflectionClass($return))->getName());
+                    } else {
+                        printf("No match for %s type %s\n", $method->getName(), $returnType);
+                    }
+                }
+                
+            } catch(\TypeError | \Exception $e) {
+                $this->warn($e);
+                $this->warn(sprintf('Encoutered error running method %s, skipping for relationship search', $method->getName()));
+            }
+        }
+
+        return $relationships;
+    }
+}
+
+class FoundReturnTypes {
+    public $types = [];
+    public $iterable;
+    public $nullable;
+    public function addType($type, $model) {
+        $this->types[] = [
+            'type' => $type,
+            'model' => $model
+        ];
+    }
+}
+
+// This is to handle PostgreSQL CITEXT column types
+// We simply define some basic overrides extending a generic text
+// column type and register it in our command constructor
+use Doctrine\DBAL\Platforms\AbstractPlatform;
+use Doctrine\DBAL\Types\TextType;
+
+final class Citext extends TextType
+{
+    const CITEXT = 'citext';
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getName()
+    {
+        return self::CITEXT;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getSQLDeclaration(array $fieldDeclaration, AbstractPlatform $platform)
+    {
+        return $platform->getDoctrineTypeMapping(self::CITEXT);
+    }
+}

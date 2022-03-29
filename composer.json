@@ -1,0 +1,24 @@
+{
+    "name": "adrenallen/eloquent-graphql-transpiler",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Adrenallen\\EloquentGraphqlTranspiler\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Garrett Allen",
+            "email": "garrettcoleallen@gmail.com"
+        }
+    ],
+    "require": {},
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Adrenallen\\EloquentGraphqlTranspiler\\EloquentGraphqlTranspilerServiceProvider"
+            ]
+        }
+    }
+}

@@ -1,0 +1,16 @@
+extend type Query {
+    {{modelQueryNamePlural}}: [{{modelName}}!]! @paginate(defaultCount: 10)
+    {{modelQueryName}}({{modelPrimaryKey}}: ID @eq): {{modelName}} @find
+    {{modelQueryNamePlural}}Where(
+        where: _ @whereConditions(columnsEnum: {{modelName}}Column)
+    ): [{{modelName}}!]! @all
+}
+
+type {{modelName}} {
+    {{modelFieldDefinitions}}
+    {{modelRelationshipDefinitions}}
+}
+
+enum {{modelName}}Column {
+    {{modelColumnEnums}}
+}
