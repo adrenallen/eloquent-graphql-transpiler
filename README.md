@@ -1,5 +1,5 @@
 # Eloquent GraphQL Transpiler
-An project to automatically generate GraphQL schemas from Eloquent models.
+A project to automatically generate GraphQL schemas from Eloquent models.
 
 This is a [Laravel artisan command](https://laravel.com/docs/master/artisan) and can be [installed via composer using the repo URL.](https://getcomposer.org/doc/05-repositories.md)
 
